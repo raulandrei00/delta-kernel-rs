@@ -16,6 +16,7 @@ use std::sync::{Arc, LazyLock};
 use delta_kernel_derive::internal_api;
 use tracing::instrument;
 
+use super::schema_evolution::{evolve_table_config, SchemaOperation};
 use super::Transaction;
 use crate::actions::deletion_vector::DeletionVectorDescriptor;
 use crate::actions::{LOG_ADD_SCHEMA, NUM_RECORDS, TIGHT_BOUNDS};
@@ -31,12 +32,12 @@ use crate::metrics::MetricId;
 use crate::scan::data_skipping::stats_schema::schema_with_all_fields_nullable;
 use crate::scan::log_replay::get_scan_metadata_transform_expr;
 use crate::scan::{restored_add_schema, scan_row_schema};
-use crate::schema::{ArrayType, SchemaRef, StructField, StructType, ToSchema};
+use crate::schema::{lazy_schema_ref, ArrayType, SchemaRef, StructField, ToSchema};
 use crate::snapshot::SnapshotRef;
 use crate::table_features::{
     iceberg_compat_v3_column_defaults_validation, Operation, TableFeature,
 };
-use crate::utils::current_time_ms;
+use crate::utils::{current_time_ms, require};
 use crate::{DataType, DeltaResult, Engine, Expression};
 
 // =============================================================================
@@ -133,6 +134,49 @@ impl Transaction {
         self
     }
 
+    /// Stages schema changes to be applied to be applied in this transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `changes` is empty, Iceberg compatibility or column defaults are enabled,
+    /// data-file actions have already been staged, or an operation is invalid for the current schema
+    /// or table configuration.
+    #[internal_api]
+    pub(crate) fn with_schema_changes(
+        mut self,
+        changes: Vec<SchemaOperation>,
+    ) -> DeltaResult<Self> {
+        if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::IcebergCompatV3)
+        {
+            return Err(Error::unsupported(
+                "Schema changes are not yet supported on tables with icebergCompatV3 enabled",
+            ));
+        }
+        if self
+            .effective_table_config
+            .is_feature_enabled(&TableFeature::AllowColumnDefaults)
+        {
+            return Err(Error::unsupported(
+                "Schema changes are not yet supported on tables with allowColumnDefaults enabled",
+            ));
+        }
+        require!(
+            !changes.is_empty(),
+            Error::generic("with_schema_changes requires at least one schema operation")
+        );
+        require!(
+            !self.has_data_file_actions(),
+            Error::invalid_transaction_state(
+                "with_schema_changes must be called before staging data files"
+            )
+        );
+        self.effective_table_config = evolve_table_config(&self.effective_table_config, changes)?;
+        self.should_emit_metadata = true;
+        Ok(self)
+    }
+
     /// Remove domain metadata from the Delta log.
     /// If the domain exists in the Delta log, this creates a tombstone to logically delete
     /// the domain. The tombstone preserves the previous configuration value.
@@ -223,16 +267,20 @@ impl Transaction {
     /// of scan file data. It joins the two together internally and will generate appropriate
     /// remove/add actions on commit to update the deletion vectors.
     ///
+    /// Required AddFile fields on matched rows are validated at commit. Staging can therefore
+    /// succeed for metadata that commit later rejects, including an empty path, negative size,
+    /// or incorrect physical partition keys.
+    ///
     /// On commit, each matched file's add action carries `stats.tightBounds: false`.
     ///
     /// # Arguments
     ///
     /// * `new_dv_descriptors` - A map from data file path (as provided in scan operations) to the
     ///   new deletion vector descriptor for that file.
-    /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata. The
-    ///   selected elements of each FilteredEngineData must be a superset of the paths that key
-    ///   `new_dv_descriptors`. Per the Delta protocol, files with deletion vectors must have an
-    ///   accurate `numRecords` statistic, so matched scan metadata must preserve that stat.
+    /// * `existing_data_files` - An iterator over FilteredEngineData from scan metadata using
+    ///   [`scan_row_schema`]. Selected rows must preserve the scan-file values and cover every path
+    ///   in `new_dv_descriptors`. Files with deletion vectors must have an accurate
+    ///   `stats.numRecords` value.
     ///
     /// # Errors
     ///
@@ -382,17 +430,11 @@ static NEW_STATS_NAME: &str = "newStats";
 /// Schema for scan row data with an additional column for new deletion vector descriptors.
 /// This is an intermediate schema used during deletion vector updates before transforming to final
 /// add actions.
-static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(
-        scan_row_schema().fields().cloned().chain([
-            StructField::nullable(
-                NEW_DELETION_VECTOR_NAME.to_string(),
-                DeletionVectorDescriptor::to_schema(),
-            ),
-            StructField::nullable(NEW_STATS_NAME.to_string(), DataType::STRING),
-        ]),
-    ))
-});
+static INTERMEDIATE_DV_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    ..(scan_row_schema().fields()),
+    nullable NEW_DELETION_VECTOR_NAME: (DeletionVectorDescriptor::to_schema()),
+    nullable NEW_STATS_NAME: STRING,
+};
 
 /// Returns the intermediate schema with deletion vector column appended to scan row schema.
 fn intermediate_dv_schema() -> &'static SchemaRef {
@@ -446,15 +488,10 @@ fn struct_deletion_vector_schema() -> &'static ArrayType {
 /// Schema for the intermediate column holding new DV descriptors.
 /// This temporary column is dropped during transformation to final add actions.
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
-static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
-    Arc::new(StructType::new_unchecked(vec![
-        StructField::nullable(
-            NEW_DELETION_VECTOR_NAME,
-            DeletionVectorDescriptor::to_schema(),
-        ),
-        StructField::nullable(NEW_STATS_NAME, DataType::STRING),
-    ]))
-});
+static NEW_DV_COLUMN_SCHEMA: LazyLock<SchemaRef> = lazy_schema_ref! {
+    nullable NEW_DELETION_VECTOR_NAME: (DeletionVectorDescriptor::to_schema()),
+    nullable NEW_STATS_NAME: STRING,
+};
 
 /// Returns the schema for the intermediate column holding new DV descriptors.
 #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
@@ -565,9 +602,10 @@ struct DvUpdateEntry {
 
 impl DvUpdateEntry {
     /// The (null DV, null stats) entry for rows that are not getting a DV update.
+    #[cfg_attr(not(feature = "internal-api"), allow(dead_code))]
     fn null() -> Self {
         static NULL_DV: LazyLock<Scalar> =
-            LazyLock::new(|| Scalar::Null(DataType::from(DeletionVectorDescriptor::to_schema())));
+            LazyLock::new(|| Scalar::null(DeletionVectorDescriptor::to_schema()));
         static NULL_STATS: LazyLock<Scalar> = LazyLock::new(|| Scalar::Null(DataType::STRING));
         Self {
             deletion_vector: NULL_DV.clone(),
